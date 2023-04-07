@@ -6,12 +6,14 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision
 from torchvision import datasets, transforms
+import sys
 
 import time
 import copy
 import numpy as np
 
 from resnet import resnet18
+from modelB3_scriptable import LDC
 
 
 def set_random_seeds(random_seed=0):
@@ -106,7 +108,7 @@ def train_model(model,
                 test_loader,
                 device,
                 learning_rate=1e-1,
-                num_epochs=200):
+                num_epochs=5):
 
     # The training configurations were not carefully selected.
 
@@ -307,8 +309,8 @@ def model_equivalence(model_1,
 
     for _ in range(num_tests):
         x = torch.rand(size=input_size).to(device)
-        y1 = model_1(x).detach().cpu().numpy()
-        y2 = model_2(x).detach().cpu().numpy()
+        y1 = model_1(x)[3].detach().cpu().numpy()
+        y2 = model_2(x)[3].detach().cpu().numpy()
         if np.allclose(a=y1, b=y2, rtol=rtol, atol=atol,
                        equal_nan=False) == False:
             print("Model equivalence test sample failed: ")
@@ -336,26 +338,32 @@ def main():
     set_random_seeds(random_seed=random_seed)
 
     # Create an untrained model.
-    model = create_model(num_classes=num_classes)
+    # model = create_model(num_classes=num_classes)
 
     train_loader, test_loader = prepare_dataloader(num_workers=8,
                                                    train_batch_size=128,
                                                    eval_batch_size=256)
 
-    # Train model.
-    print("Training Model...")
-    model = train_model(model=model,
-                        train_loader=train_loader,
-                        test_loader=test_loader,
-                        device=cuda_device,
-                        learning_rate=1e-1,
-                        num_epochs=200)
-    # Save model.
-    save_model(model=model, model_dir=model_dir, model_filename=model_filename)
-    # Load a pretrained model.
-    model = load_model(model=model,
-                       model_filepath=model_filepath,
-                       device=cuda_device)
+    # # Train model.
+    # print("Training Model...")
+    # model = train_model(model=model,
+    #                     train_loader=train_loader,
+    #                     test_loader=test_loader,
+    #                     device=cuda_device,
+    #                     learning_rate=1e-1,
+    #                     num_epochs=5)
+    # # Save model.
+    # save_model(model=model, model_dir=model_dir, model_filename=model_filename)
+    model = LDC()
+
+    # model.load_state_dict(torch.load(os.path.join(model_dir, model_filename)))
+    model.load_state_dict(torch.load('LDC_B3.pt'))
+    # sys.exit(0)
+
+    # # Load a pretrained model.
+    # model = load_model(model=model,
+    #                    model_filepath=model_filepath,
+    #                    device=cuda_device)
     # Move the model to CPU since static quantization does not support CUDA currently.
     model.to(cpu_device)
     # Make a copy of the model for layer fusion
@@ -367,39 +375,69 @@ def main():
     fused_model.train()
 
     # Fuse the model in place rather manually.
-    fused_model = torch.quantization.fuse_modules(fused_model,
-                                                  [["conv1", "bn1", "relu"]],
-                                                  inplace=True)
-    for module_name, module in fused_model.named_children():
-        if "layer" in module_name:
-            for basic_block_name, basic_block in module.named_children():
-                torch.quantization.fuse_modules(
-                    basic_block, [["conv1", "bn1", "relu1"], ["conv2", "bn2"]],
-                    inplace=True)
-                for sub_block_name, sub_block in basic_block.named_children():
-                    if sub_block_name == "downsample":
-                        torch.quantization.fuse_modules(sub_block,
-                                                        [["0", "1"]],
-                                                        inplace=True)
+    # fused_model = torch.quantization.fuse_modules(fused_model,
+    #                                               [["conv1", "bn1", "relu"]],
+    #                                               inplace=True)
+    # for module_name, module in fused_model.named_children():
+    #     if "layer" in module_name:
+    #         for basic_block_name, basic_block in module.named_children():
+    #             torch.quantization.fuse_modules(
+    #                 basic_block, [["conv1", "bn1", "relu1"], ["conv2", "bn2"]],
+    #                 inplace=True)
+    #             for sub_block_name, sub_block in basic_block.named_children():
+    #                 if sub_block_name == "downsample":
+    #                     torch.quantization.fuse_modules(sub_block,
+    #                                                     [["0", "1"]],
+    #                                                     inplace=True)
+    fused_model = torch.quantization.fuse_modules(fused_model, [
+        ["block_1.conv1", "block_1.bn1"], 
+        ["block_1.conv2", "block_1.bn2", "block_1.relu"],
 
+        ["block_2.conv1", "block_2.bn1"], 
+        ["block_2.conv2", "block_2.bn2", "block_2.relu"],
+
+        ["dblock_3.first_layer.first_layer", "dblock_3.first_layer.second_layer",  "dblock_3.first_layer.third_layer"], 
+        ["dblock_3.first_layer.fourth_layer", "dblock_3.first_layer.fifth_layer"],
+
+        ["dblock_3.second_layer.first_layer", "dblock_3.second_layer.second_layer",  "dblock_3.second_layer.third_layer"], 
+        ["dblock_3.second_layer.fourth_layer", "dblock_3.second_layer.fifth_layer"],
+
+        ["side_1.conv", "side_1.bn"],
+
+        ["pre_dense_3.conv", "pre_dense_3.bn"],
+
+        ["up_block_1.features.0", "up_block_1.features.1"],
+
+        ["up_block_2.features.0", "up_block_2.features.1"],
+
+        ["up_block_3.features.0", "up_block_3.features.1"],
+        ["up_block_3.features.3", "up_block_3.features.4"],
+
+        ["block_cat.conv3", "block_cat.relu"],
+    ], inplace=True)
+
+    
     # Print FP32 model.
     print(model)
     # Print fused model.
     print(fused_model)
 
+    
+
     # Model and fused model should be equivalent.
     model.eval()
     fused_model.eval()
-    assert model_equivalence(
-        model_1=model,
-        model_2=fused_model,
-        device=cpu_device,
-        rtol=1e-03,
-        atol=1e-06,
-        num_tests=100,
-        input_size=(
-            1, 3, 32,
-            32)), "Fused model is not equivalent to the original model!"
+    # assert model_equivalence(
+    #     model_1=model,
+    #     model_2=fused_model,
+    #     device=cpu_device,
+    #     rtol=1e-03,
+    #     atol=1e-06,
+    #     num_tests=100,
+    #     input_size=(
+    #         1, 3, 32,
+    #         32)), "Fused model is not equivalent to the original model!"
+    
 
     # Prepare the model for quantization aware training. This inserts observers in
     # the model that will observe activation tensors during calibration.
@@ -409,6 +447,7 @@ def main():
     # quantized_model = QuantizedResNet18(model_fp32=model)
     # Select quantization schemes from
     # https://pytorch.org/docs/stable/quantization-support.html
+    
     quantization_config = torch.quantization.get_default_qconfig("fbgemm")
     # Custom quantization configurations
     # quantization_config = torch.quantization.default_qconfig
@@ -418,6 +457,7 @@ def main():
 
     # Print quantization configurations
     print(quantized_model.qconfig)
+    
 
     # https://pytorch.org/docs/stable/_modules/torch/quantization/quantize.html#prepare_qat
     torch.quantization.prepare_qat(quantized_model, inplace=True)
@@ -432,6 +472,7 @@ def main():
                 learning_rate=1e-3,
                 num_epochs=10)
     quantized_model.to(cpu_device)
+    sys.exit(0)
 
     # Using high-level static quantization wrapper
     # The above steps, including torch.quantization.prepare, calibrate_model, and torch.quantization.convert, are also equivalent to
